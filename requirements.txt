@@ -1,0 +1,6 @@
+opencv-python==4.8.1.78
+mediapipe==0.10.7
+google-generativeai==0.3.2
+numpy==1.24.3
+ultralytics==8.0.196
+python-dotenv==1.0.0

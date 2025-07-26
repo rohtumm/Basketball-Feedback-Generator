@@ -456,8 +456,9 @@ def extract_shooting_sequence_with_display(video_path, window_name, x_offset=0):
                 cv2.putText(frame, "Status: ready", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             
-            # Draw keypoints
+            # Draw keypoints with transparency
             h, w, _ = frame.shape
+            overlay = frame.copy()
             for name, (x, y) in keypoints.items():
                 cx, cy = int(x * w), int(y * h)
                 if "wrist" in name:
@@ -466,7 +467,9 @@ def extract_shooting_sequence_with_display(video_path, window_name, x_offset=0):
                     color = (255, 0, 255)
                 else:
                     color = (0, 255, 0)
-                cv2.circle(frame, (cx, cy), 6, color, -1)
+                cv2.circle(overlay, (cx, cy), 3, color, -1)
+            # Blend overlay with original frame (0.4 opacity for keypoints)
+            cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
             
             # Store frame if we're in shooting sequence
             if motion_detector.state in ["start_detected", "tracking", "peak_reached"]:
@@ -615,6 +618,90 @@ def stretch_segment(frames, target_length):
     
     return stretched
 
+def calculate_optimal_crop_region(frames):
+    """Calculate the optimal crop region for the entire video sequence"""
+    all_min_x, all_max_x = [], []
+    all_min_y, all_max_y = [], []
+    
+    # Analyze pose landmarks across all frames
+    for frame in frames:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb_frame)
+        
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            h, w = frame.shape[:2]
+            
+            # Extract coordinates of visible landmarks
+            x_coords = [int(lm.x * w) for lm in landmarks if lm.visibility > 0.5]
+            y_coords = [int(lm.y * h) for lm in landmarks if lm.visibility > 0.5]
+            
+            if x_coords and y_coords:
+                all_min_x.append(min(x_coords))
+                all_max_x.append(max(x_coords))
+                all_min_y.append(min(y_coords))
+                all_max_y.append(max(y_coords))
+    
+    if not all_min_x:  # No pose detected in any frame
+        return None
+    
+    # Find overall bounding box across entire sequence
+    overall_min_x = min(all_min_x)
+    overall_max_x = max(all_max_x)
+    overall_min_y = min(all_min_y)
+    overall_max_y = max(all_max_y)
+    
+    # Add padding
+    width = overall_max_x - overall_min_x
+    height = overall_max_y - overall_min_y
+    padding_x = int(width * 0.3)
+    padding_y = int(height * 0.2)
+    
+    h, w = frames[0].shape[:2]
+    crop_x1 = max(0, overall_min_x - padding_x)
+    crop_y1 = max(0, overall_min_y - padding_y)
+    crop_x2 = min(w, overall_max_x + padding_x)
+    crop_y2 = min(h, overall_max_y + padding_y)
+    
+    # Ensure minimum aspect ratio of 0.67 (width/height >= 0.67)
+    crop_width = crop_x2 - crop_x1
+    crop_height = crop_y2 - crop_y1
+    current_ratio = crop_width / crop_height
+    
+    if current_ratio < 0.67:
+        # Need to increase width to meet minimum ratio
+        target_width = int(crop_height * 0.67)
+        width_increase = target_width - crop_width
+        
+        # Expand width symmetrically if possible
+        left_expand = width_increase // 2
+        right_expand = width_increase - left_expand
+        
+        new_x1 = max(0, crop_x1 - left_expand)
+        new_x2 = min(w, crop_x2 + right_expand)
+        
+        # If we hit boundaries, adjust the other side
+        if new_x1 == 0:
+            new_x2 = min(w, new_x2 + (crop_x1 - new_x1))
+        if new_x2 == w:
+            new_x1 = max(0, new_x1 - (new_x2 - crop_x2))
+            
+        crop_x1, crop_x2 = new_x1, new_x2
+    
+    return (crop_x1, crop_y1, crop_x2, crop_y2)
+
+def apply_consistent_crop(frame, crop_region):
+    """Apply consistent crop region to a frame"""
+    if crop_region is None:
+        return frame
+    
+    crop_x1, crop_y1, crop_x2, crop_y2 = crop_region
+    
+    # Simply crop the frame - no resizing to maintain natural dimensions
+    cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+    
+    return cropped
+
 def play_sequences_side_by_side(frames1, frames2, video1_name, video2_name, transitions1=None, transitions2=None):
     """Display both shooting video sequences side by side for visual comparison"""
     print(f"\n5. Playing aligned shooting sequences side by side...")
@@ -628,6 +715,11 @@ def play_sequences_side_by_side(frames1, frames2, video1_name, video2_name, tran
     if transitions1 and transitions2:
         frames1, frames2 = align_sequences_by_transitions(frames1, frames2, transitions1, transitions2)
     
+    # Calculate optimal crop regions for consistent framing throughout each video
+    print("Calculating optimal crop regions for consistent framing...")
+    crop_region1 = calculate_optimal_crop_region(frames1)
+    crop_region2 = calculate_optimal_crop_region(frames2)
+    
     max_frames = max(len(frames1), len(frames2))
     
     for i in range(max_frames):
@@ -635,11 +727,24 @@ def play_sequences_side_by_side(frames1, frames2, video1_name, video2_name, tran
         frame1 = frames1[min(i, len(frames1)-1)].copy()
         frame2 = frames2[min(i, len(frames2)-1)].copy()
         
+        # Apply consistent crop regions (each maintains its own natural width)
+        frame1 = apply_consistent_crop(frame1, crop_region1)
+        frame2 = apply_consistent_crop(frame2, crop_region2)
+        
         # Add titles to frames
         cv2.putText(frame1, video1_name, (10, frame1.shape[0] - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
         cv2.putText(frame2, video2_name, (10, frame2.shape[0] - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        
+        # Ensure both frames have the same height for side-by-side display
+        h1, h2 = frame1.shape[0], frame2.shape[0]
+        if h1 != h2:
+            target_height = max(h1, h2)
+            if h1 < target_height:
+                frame1 = cv2.resize(frame1, (frame1.shape[1], target_height))
+            if h2 < target_height:
+                frame2 = cv2.resize(frame2, (frame2.shape[1], target_height))
         
         # Combine frames side by side
         combined_frame = np.hstack((frame1, frame2))
@@ -704,7 +809,9 @@ def create_skeleton_frame(pose_data, title, size):
             color = (255, 0, 0)    # Blue for elbows
         else:
             color = (128, 128, 128) # Gray for others
-        cv2.circle(frame, (cx, cy), 8, color, -1)
+        overlay = frame.copy()
+        cv2.circle(overlay, (cx, cy), 4, color, -1)
+        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
     
     return frame
 
@@ -833,6 +940,7 @@ def main():
                 cv2.putText(frame, "Status: ready", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
+            overlay = frame.copy()
             for name, (x, y) in keypoints.items():
                 cx, cy = int(x * w), int(y * h)
                 if name == "ball":
@@ -843,7 +951,9 @@ def main():
                     color = (255, 0, 255)
                 else:
                     color = (0, 255, 0)
-                cv2.circle(frame, (cx, cy), 6, color, -1)
+                cv2.circle(overlay, (cx, cy), 3, color, -1)
+            # Blend overlay with original frame (0.4 opacity for keypoints)
+            cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
         def draw_feedback(frame, feedback_text, x=15, y=30, max_width=620, line_height=25):
             lines = []

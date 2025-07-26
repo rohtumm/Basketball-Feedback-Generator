@@ -8,52 +8,39 @@ from dotenv import load_dotenv
 import os
 import argparse
 
+import torch
+from torch.serialization import safe_globals
+from ultralytics.nn.tasks import DetectionModel
+
 # gemini api key setup
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("models/gemini-2.0-flash-lite")
 
-# YOLOv8 ball detection
-try:
-    # Try to load existing model first
-    yolo_model = YOLO("yolov8n.pt")
-    ball_detection_enabled = True
-    print("✅ Ball detection enabled (YOLOv8)")
-except Exception as e:
-    print(f"⚠️  Local model failed: {e}")
-    try:
-        # Try to download fresh model
-        print("🔄 Downloading fresh YOLOv8 model...")
-        yolo_model = YOLO("yolov8n.pt", verbose=False)  # This will auto-download
-        ball_detection_enabled = True
-        print("✅ Ball detection enabled (Downloaded YOLOv8)")
-    except Exception as e2:
-        print(f"⚠️  Ball detection disabled: {e2}")
-        ball_detection_enabled = False
-        yolo_model = None
+# Ball detection enabled with new implementation
+ball_detection_enabled = True
+print("✅ Ball detection enabled (Red-based)")
+
+import cv2
+import numpy as np
 
 def detect_ball(frame):
-    if not ball_detection_enabled or yolo_model is None:
-        return None
-        
-    try:
-        results = yolo_model.predict(source=frame, verbose=False)[0]
-        if results.boxes is None:
-            return None
-            
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            label = results.names[cls_id]
-            if "ball" in label.lower() or "sports ball" in label.lower():
-                x1, y1, x2, y2 = box.xyxy[0]
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-                return (cx, cy)
-        return None
-    except Exception as e:
-        print(f"Ball detection error: {e}")
-        return None
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_red = np.array([0, 100, 100])
+    upper_red = np.array([10, 255, 255])
+    mask = cv2.inRange(hsv, lower_red, upper_red)
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            return (cx, cy)
+    return None
+
 
 def calculate_ball_wrist_metrics(ball_pos, wrist_pos, frame_shape):
     """Calculate relationship between ball and wrist positions"""
@@ -225,6 +212,26 @@ class SimpleShootingDetector:
         self.current_frame_count += 1
         return result
     
+    def add_pose_with_ball(self, pose, ball_pos=None):
+        """Add pose with optional ball position for enhanced detection"""
+        # Add new pose to buffer
+        self.pose_buffer.append(pose)
+        
+        # Maintain buffer size
+        if len(self.pose_buffer) > self.buffer_size:
+            self.pose_buffer.pop(0)
+            # Adjust start_frame_index if we're tracking
+            if self.state != "waiting" and self.start_frame_index > 0:
+                self.start_frame_index -= 1
+            elif self.state != "waiting" and self.start_frame_index == 0:
+                # Start frame was removed, reset detection
+                self.reset_detection()
+        
+        # Run state machine with ball position
+        result = self.process_state(ball_pos)
+        self.current_frame_count += 1
+        return result
+    
     def finalize_on_video_end(self):
         """Call this when video ends to finalize any incomplete shooting sequence"""
         if self.state in ["tracking", "peak_reached"] and not self.shooting_completed:
@@ -236,7 +243,7 @@ class SimpleShootingDetector:
             return True, shooting_sequence
         return False, None
         
-    def process_state(self):
+    def process_state(self, ball_pos=None):
         if len(self.pose_buffer) < 3:
             return False, "waiting"
             
@@ -254,7 +261,7 @@ class SimpleShootingDetector:
         elif self.state == "start_detected":
             return self.check_upward_movement(wrist_y, elbow_y)
         elif self.state == "tracking":
-            return self.track_motion(wrist_y, elbow_y, shoulder_y)
+            return self.track_motion(wrist_y, elbow_y, shoulder_y, ball_pos)
         elif self.state == "peak_reached":
             return self.check_completion(wrist_y, elbow_y, shoulder_y)
             
@@ -308,17 +315,37 @@ class SimpleShootingDetector:
                 return False, "tracking"
         return False, "start_detected"
         
-    def track_motion(self, wrist_y, elbow_y, shoulder_y):
+    def track_motion(self, wrist_y, elbow_y, shoulder_y, ball_pos=None):
         # Update peak wrist position
         if wrist_y < self.peak_wrist_y:
             self.peak_wrist_y = wrist_y
             self.frames_since_peak = 0
         else:
             self.frames_since_peak += 1
-            
-        # Check if wrist has reached peak (stopped going up for a few frames)
-        if self.frames_since_peak >= 3:
-            print(f"🏀 State: tracking → peak_reached (wrist peak at {self.peak_wrist_y:.3f})")
+        
+        # If ball is detected, check if ball has left the wrist area (release point)
+        if ball_pos is not None:
+            current_pose = self.pose_buffer[-1] if self.pose_buffer else None
+            if current_pose and "right_wrist" in current_pose:
+                wrist_pos = current_pose["right_wrist"]
+                # Calculate ball-wrist distance in normalized coordinates
+                ball_norm_x = ball_pos[0] / 640  # Assuming resized frame width
+                ball_norm_y = ball_pos[1] / 480  # Assuming resized frame height
+                wrist_x, wrist_y_pos = wrist_pos[0], wrist_pos[1]
+                
+                distance = ((ball_norm_x - wrist_x)**2 + (ball_norm_y - wrist_y_pos)**2)**0.5
+                
+                # If ball is far enough from wrist AND wrist is above shoulder, consider it released (peak reached)
+                if distance > 0.15 and wrist_y < shoulder_y:  # Ball release + wrist above shoulder
+                    print(f"🏀 State: tracking → peak_reached (ball released, distance: {distance:.3f}, wrist above shoulder)")
+                    self.state = "peak_reached"
+                    self.transition_points["peak_reached"] = self.current_frame_count
+                    return False, "peak_reached"
+        
+        # Fallback to original logic if no ball detected or ball still close to wrist
+        # Check if wrist has reached peak (stopped going up for a few frames) AND wrist is above shoulder
+        if self.frames_since_peak >= 3 and wrist_y < shoulder_y:
+            print(f"🏀 State: tracking → peak_reached (wrist peak at {self.peak_wrist_y:.3f}, wrist above shoulder)")
             self.state = "peak_reached"
             self.transition_points["peak_reached"] = self.current_frame_count
             return False, "peak_reached"
@@ -405,13 +432,21 @@ def extract_shooting_sequence_with_display(video_path, window_name, x_offset=0):
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(rgb_frame)
         
+        h, w, _ = frame.shape
+        ball_position = detect_ball(frame)
+        
         if results.pose_landmarks:
             # Draw pose landmarks
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             keypoints = extract_keypoints(results.pose_landmarks.landmark)
             
-            # Add pose to detector and check for shooting
-            shooting_detected, result = motion_detector.add_pose(keypoints)
+            # Ball detection for release point analysis (no visual marking)
+            if ball_position:
+                norm_ball = (ball_position[0] / w, ball_position[1] / h)
+                keypoints["ball"] = norm_ball
+            
+            # Add pose to detector and check for shooting (with ball position if available)
+            shooting_detected, result = motion_detector.add_pose_with_ball(keypoints, ball_position)
             
             # Display current detection state
             if isinstance(result, str):
@@ -616,7 +651,7 @@ def play_sequences_side_by_side(frames1, frames2, video1_name, video2_name, tran
         cv2.imshow("Shooting Comparison", combined_frame)
         cv2.moveWindow("Shooting Comparison", 50, 50)
         
-        key = cv2.waitKey(500)  # Auto-advance after 500ms
+        key = cv2.waitKey(100)  # Auto-advance after 167ms (3x faster)
         if key & 0xFF == ord('q'):
             break
     
@@ -775,39 +810,13 @@ def main():
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             keypoints = extract_keypoints(results.pose_landmarks.landmark)
 
-            # Ball detection visualization
+            # Ball detection for release point analysis (no visual marking)
             if ball_position:
-                # Draw bright red circle around detected ball
-                cv2.circle(frame, ball_position, 15, (0, 0, 255), 3)
-                # Add "BALL" label above the detection
-                cv2.putText(frame, "BALL", (ball_position[0] - 20, ball_position[1] - 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
                 norm_ball = (ball_position[0] / w, ball_position[1] / h)
                 keypoints["ball"] = norm_ball
-                
-                # Calculate ball-wrist relationship
-                if "right_wrist" in keypoints:
-                    ball_wrist_metrics = calculate_ball_wrist_metrics(
-                        ball_position, keypoints["right_wrist"], frame.shape
-                    )
-                    if ball_wrist_metrics:
-                        # Display ball-wrist info on frame
-                        cv2.putText(frame, f"Ball-Wrist: {ball_wrist_metrics['distance']:.0f}px", 
-                                   (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        cv2.putText(frame, f"Position: {ball_wrist_metrics['position']}", 
-                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        
-                        # Draw bright yellow line between ball and wrist
-                        cv2.line(frame, ball_position, ball_wrist_metrics['wrist_coords'], 
-                                (0, 255, 255), 3)
-            else:
-                # Show when ball is NOT detected
-                cv2.putText(frame, "Ball: NOT DETECTED", (10, 110), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # Add pose to detector and check for shooting
-            shooting_detected, result = motion_detector.add_pose(keypoints)
+            # Add pose to detector and check for shooting (with ball position if available)
+            shooting_detected, result = motion_detector.add_pose_with_ball(keypoints, ball_position)
             
             if shooting_detected and isinstance(result, list) and not feedback_displayed:
                 print(f"Shooting motion detected! Captured {len(result)} frames. Sending to Gemini.")

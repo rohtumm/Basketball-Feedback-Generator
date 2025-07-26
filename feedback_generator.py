@@ -702,6 +702,109 @@ def apply_consistent_crop(frame, crop_region):
     
     return cropped
 
+def save_comparison_video(frames1, frames2, video1_name, video2_name, transitions1=None, transitions2=None):
+    """Generate and save side-by-side comparison video"""
+    print(f"\n5. Generating side-by-side comparison video...")
+    
+    if not frames1 or not frames2:
+        print("Error: No video frames available for comparison")
+        return None
+    
+    # Align sequences if transition data is available
+    if transitions1 and transitions2:
+        frames1, frames2 = align_sequences_by_transitions(frames1, frames2, transitions1, transitions2)
+    
+    # Calculate optimal crop regions for consistent framing throughout each video
+    print("Calculating optimal crop regions for consistent framing...")
+    crop_region1 = calculate_optimal_crop_region(frames1)
+    crop_region2 = calculate_optimal_crop_region(frames2)
+    
+    max_frames = max(len(frames1), len(frames2))
+    output_frames = []
+    
+    for i in range(max_frames):
+        # Get frames (repeat last frame if one sequence is shorter)
+        frame1 = frames1[min(i, len(frames1)-1)].copy()
+        frame2 = frames2[min(i, len(frames2)-1)].copy()
+        
+        # Apply consistent crop regions (each maintains its own natural width)
+        frame1 = apply_consistent_crop(frame1, crop_region1)
+        frame2 = apply_consistent_crop(frame2, crop_region2)
+        
+        # Add titles to frames
+        cv2.putText(frame1, video1_name, (10, frame1.shape[0] - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        cv2.putText(frame2, video2_name, (10, frame2.shape[0] - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        
+        # Ensure both frames have the same height for side-by-side display
+        h1, h2 = frame1.shape[0], frame2.shape[0]
+        if h1 != h2:
+            target_height = max(h1, h2)
+            if h1 < target_height:
+                frame1 = cv2.resize(frame1, (frame1.shape[1], target_height))
+            if h2 < target_height:
+                frame2 = cv2.resize(frame2, (frame2.shape[1], target_height))
+        
+        # Combine frames side by side
+        combined_frame = np.hstack((frame1, frame2))
+        
+        # Add frame counter
+        cv2.putText(combined_frame, f"Frame: {i+1}/{max_frames}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        output_frames.append(combined_frame)
+    
+    # Save video with web-compatible settings
+    import os
+    os.makedirs("videos", exist_ok=True)
+    output_path = "videos/comparison_output.mp4"
+    
+    if output_frames:
+        height, width = output_frames[0].shape[:2]
+        
+        # Try different codecs for web compatibility
+        codecs_to_try = ['XVID', 'mp4v', 'avc1']
+        out = None
+        
+        for codec in codecs_to_try:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            out = cv2.VideoWriter(output_path, fourcc, 10.0, (width, height))
+            if out.isOpened():
+                print(f"Using codec: {codec}")
+                break
+            out.release()
+        
+        if not out or not out.isOpened():
+            print("Failed to open video writer with any codec")
+            return None
+        
+        for frame in output_frames:
+            out.write(frame)
+        
+        out.release()
+        print(f"✅ Comparison video saved to: {output_path}")
+        
+        # Try to re-encode with ffmpeg for better web compatibility if available
+        try:
+            import subprocess
+            web_compatible_path = "videos/comparison_web.mp4"
+            result = subprocess.run([
+                'ffmpeg', '-i', output_path, '-c:v', 'libx264', '-preset', 'medium',
+                '-crf', '23', '-c:a', 'aac', '-movflags', '+faststart', '-y', web_compatible_path
+            ], capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0 and os.path.exists(web_compatible_path):
+                # Replace original with web-compatible version
+                os.replace(web_compatible_path, output_path)
+                print("✅ Video re-encoded for web compatibility")
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            print(f"⚠️ FFmpeg re-encoding failed: {e}, using original video")
+        
+        return output_path
+    
+    return None
+
 def play_sequences_side_by_side(frames1, frames2, video1_name, video2_name, transitions1=None, transitions2=None):
     """Display both shooting video sequences side by side for visual comparison"""
     print(f"\n5. Playing aligned shooting sequences side by side...")
@@ -839,6 +942,9 @@ def compare_videos(video1_path, video2_path):
     
     # Show actual video sequences side by side with keypoints (aligned by transitions)
     play_sequences_side_by_side(frames1, frames2, "Video 1 Sequence", "Video 2 Sequence", transitions1, transitions2)
+    
+    # Generate and save comparison video
+    video_path = save_comparison_video(frames1, frames2, "Player", "Benchmark", transitions1, transitions2)
     
     print(f"\n6. Generating AI coaching feedback...")
     print("Analyzing player's form against benchmark...")

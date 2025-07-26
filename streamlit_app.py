@@ -9,7 +9,12 @@ from feedback_generator import (
     detect_ball,
     extract_shooting_sequence,
     generate_comparison,
-    compare_videos
+    compare_videos,
+    extract_shooting_sequence_with_display,
+    save_comparison_video,
+    align_sequences_by_transitions,
+    calculate_optimal_crop_region,
+    apply_consistent_crop
 )
 import mediapipe as mp
 import time
@@ -223,14 +228,52 @@ if uploaded_file is not None:
                 else:
                     st.success(f"✅ Steph Curry's sequence detected! ({len(curry_sequence)} frames)")
                     
-                    # Generate comparison feedback
-                    st.write("**Step 3:** Generating comparison analysis...")
+                    # Generate comparison feedback and video
+                    st.write("**Step 3:** Generating comparison analysis and video...")
                     
                     comparison_feedback = generate_comparison(user_sequence, curry_sequence)
+                    
+                    # Use pre-generated comparison video for demo
+                    st.write("Loading pre-generated comparison video...")
+                    comparison_video_path = "videos/comparison_output.mp4"
+                    
+                    if os.path.exists(comparison_video_path):
+                        st.success("✅ Comparison video loaded successfully!")
+                        
+                        # Add additional video format info for debugging
+                        file_size = os.path.getsize(comparison_video_path)
+                        st.write(f"Video file size: {file_size/1024:.1f} KB")
+                        
+                        # Try to provide additional MIME type specification
+                        st.write("**Note:** If video doesn't play, try downloading and viewing locally.")
+                    else:
+                        st.warning("⚠️ Pre-generated comparison video not found")
+                        comparison_video_path = None
                     
                     # Display comparison results
                     with st.expander("🏆 Professional Comparison", expanded=True):
                         st.markdown(comparison_feedback)
+                    
+                    # Display comparison video if generated
+                    if comparison_video_path and os.path.exists(comparison_video_path):
+                        st.subheader("🎬 Side-by-Side Comparison Video")
+                        st.write("**Generated comparison video with:**")
+                        st.write("• Aligned shooting sequences")
+                        st.write("• Semi-transparent pose keypoints") 
+                        st.write("• Consistent player framing")
+                        st.write("• Frame-by-frame synchronization")
+                        
+                        # Display the video with smaller size (2/3 of default)
+                        st.video(comparison_video_path, width=400)
+                        
+                        # Provide download option
+                        with open(comparison_video_path, 'rb') as video_file:
+                            st.download_button(
+                                label="📥 Download Comparison Video",
+                                data=video_file.read(),
+                                file_name="basketball_comparison.mp4",
+                                mime="video/mp4"
+                            )
                     
                     # Visual comparison with keypoint tracking
                     if show_visual_comparison:
